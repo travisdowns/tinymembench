@@ -446,6 +446,11 @@ bench_info *get_asm_framebuffer_benchmarks(void)
         return empty;
 }
 
+bench_info *get_avx2_benchmarks(void) { return empty; }
+bench_info *get_avx2_framebuffer_benchmarks(void) { return empty; }
+bench_info *get_avx512_benchmarks(void) { return empty; }
+bench_info *get_avx512_framebuffer_benchmarks(void) { return empty; }
+
 #elif defined(__aarch64__)
 
 #include "aarch64-asm.h"
@@ -484,6 +489,11 @@ bench_info *get_asm_framebuffer_benchmarks(void)
 {
     return aarch64_neon_fb;
 }
+
+bench_info *get_avx2_benchmarks(void) { return empty; }
+bench_info *get_avx2_framebuffer_benchmarks(void) { return empty; }
+bench_info *get_avx512_benchmarks(void) { return empty; }
+bench_info *get_avx512_framebuffer_benchmarks(void) { return empty; }
 
 #elif defined(__mips__) && defined(_ABIO32)
 
@@ -525,6 +535,11 @@ bench_info *get_asm_framebuffer_benchmarks(void)
     return empty;
 }
 
+bench_info *get_avx2_benchmarks(void) { return empty; }
+bench_info *get_avx2_framebuffer_benchmarks(void) { return empty; }
+bench_info *get_avx512_benchmarks(void) { return empty; }
+bench_info *get_avx512_framebuffer_benchmarks(void) { return empty; }
+
 #else
 
 bench_info *get_asm_benchmarks(void)
@@ -536,5 +551,10 @@ bench_info *get_asm_framebuffer_benchmarks(void)
 {
     return empty;
 }
+
+bench_info *get_avx2_benchmarks(void) { return empty; }
+bench_info *get_avx2_framebuffer_benchmarks(void) { return empty; }
+bench_info *get_avx512_benchmarks(void) { return empty; }
+bench_info *get_avx512_framebuffer_benchmarks(void) { return empty; }
 
 #endif
