@@ -134,7 +134,7 @@ static void parallel_run(void)
     pthread_cond_broadcast(&p_start);
 }
 
-static void parallel_init(int threads)
+static void parallel_init(int threads, int pin)
 {
     int i;
     pthread_attr_t attr;
@@ -160,14 +160,14 @@ static void parallel_init(int threads)
 
     for (i = 0; i < threads; ++i)
     {
-#if 1
-        CPU_ZERO(&cpus);
-        CPU_SET(i, &cpus);
-        pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpus);
-        pthread_create(p_worker + i, &attr, thread_func, worker_data + i);
-#else
-        pthread_create(p_worker + i, NULL, thread_func, worker_data + i);
-#endif
+        if (pin)
+        {
+            CPU_ZERO(&cpus);
+            CPU_SET(i, &cpus);
+            pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpus);
+        }
+        pthread_create(p_worker + i, pin ? &attr : NULL,
+                       thread_func, worker_data + i);
     }
 
     pthread_mutex_lock(&p_lock);
@@ -179,7 +179,7 @@ static void parallel_init(int threads)
 }
 #endif
 
-static double bandwidth_bench_helper(int threads,
+static double bandwidth_bench_helper(int threads, int pin,
                                      int64_t *dstbuf, int64_t *srcbuf,
                                      int64_t *tmpbuf,
                                      int size, int blocksize,
@@ -200,7 +200,7 @@ static double bandwidth_bench_helper(int threads,
     for (n = 0; n < MAXREPEATS; n++)
     {
 #if 1
-        parallel_init(threads);
+        parallel_init(threads, pin);
         for (pt = 0; pt < threads; ++pt)
         {
             (worker_data + pt)->func = f;
@@ -239,7 +239,7 @@ static double bandwidth_bench_helper(int threads,
                 for (i = 0; i < innerloopcount; i++)
                 {
 #if 1
-                    parallel_init(threads);
+                    parallel_init(threads, pin);
                     for (pt = 0; pt < threads; ++pt)
                     {
                         (worker_data + pt)->func = f;
@@ -332,14 +332,14 @@ static bench_info libc_benchmarks[] =
         {"standard memset", 0, memset_wrapper},
         {NULL, 0, NULL}};
 
-void bandwidth_bench(int threads,
+void bandwidth_bench(int threads, int pin,
                      int64_t *dstbuf, int64_t *srcbuf, int64_t *tmpbuf,
                      int size, int blocksize, const char *indent_prefix,
                      bench_info *bi)
 {
     while (bi->f)
     {
-        bandwidth_bench_helper(threads,
+        bandwidth_bench_helper(threads, pin,
                                dstbuf, srcbuf, tmpbuf,
                                size, blocksize,
                                indent_prefix, bi->use_tmpbuf,
@@ -682,7 +682,7 @@ int latency_bench(size_t size, int count, int use_hugepage)
     return 1;
 }
 
-static void memtest(int threads, void *dstbuf, void *srcbuf, void *tmpbuf, size_t bufsize, size_t blocksize, const char *comment)
+static void memtest(int threads, int pin, void *dstbuf, void *srcbuf, void *tmpbuf, size_t bufsize, size_t blocksize, const char *comment)
 {
     printf("\n");
     printf("==========================================================================\n");
@@ -705,29 +705,29 @@ static void memtest(int threads, void *dstbuf, void *srcbuf, void *tmpbuf, size_
     printf("==         brackets                                                     ==\n");
     printf("==========================================================================\n\n");
 
-    bandwidth_bench(threads, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, " ", c_benchmarks);
+    bandwidth_bench(threads, pin, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, " ", c_benchmarks);
     printf(" ---\n");
-    bandwidth_bench(threads, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, " ", libc_benchmarks);
+    bandwidth_bench(threads, pin, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, " ", libc_benchmarks);
 
     bench_info *bi = get_asm_benchmarks();
     if (bi && bi->f)
     {
         printf(" ---\n");
-        bandwidth_bench(threads, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, " ", bi);
+        bandwidth_bench(threads, pin, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, " ", bi);
     }
 
     bench_info *bi_avx2 = get_avx2_benchmarks();
     if (bi_avx2 && bi_avx2->f)
     {
         printf(" ---\n");
-        bandwidth_bench(threads, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, " ", bi_avx2);
+        bandwidth_bench(threads, pin, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, " ", bi_avx2);
     }
 
     bench_info *bi_avx512 = get_avx512_benchmarks();
     if (bi_avx512 && bi_avx512->f)
     {
         printf(" ---\n");
-        bandwidth_bench(threads, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, " ", bi_avx512);
+        bandwidth_bench(threads, pin, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, " ", bi_avx512);
     }
 }
 
@@ -745,6 +745,7 @@ usage()
     //  fprintf(stderr, "\t--run_sse Include AVX2 tests <false>\n");
     // fprintf(stderr, "\t--run_sse Include AVX512 tests <false>\n");
     fprintf(stderr, "\t-t Thread count, 0 means %ld (max)\n", sysconf(_SC_NPROCESSORS_ONLN));
+    fprintf(stderr, "\t-u Run without pinning threads to CPUs\n");
     exit(EXIT_FAILURE);
 }
 
@@ -776,6 +777,7 @@ int main(int argc, char *argv[])
     int memfd = -1;
     int total_cpu = sysconf(_SC_NPROCESSORS_ONLN);
     int threads = -1;
+    int pin_threads = 1;
 
     if (0 == geteuid())
     {
@@ -793,7 +795,7 @@ int main(int argc, char *argv[])
             {0, 0, 0, 0}};
         /* getopt_long stores the option index here. */
         int option_index = 0;
-        c = getopt_long(argc, argv, "hb:c:l:s:m:t:", long_options, &option_index);
+        c = getopt_long(argc, argv, "hb:c:l:s:m:t:u", long_options, &option_index);
         if (c == -1)
             break;
         switch (c)
@@ -824,6 +826,9 @@ int main(int argc, char *argv[])
         case 't':
             threads = atoi(optarg);
             break;
+        case 'u':
+            pin_threads = 0;
+            break;
         case 'h':
         default:
             usage();
@@ -849,7 +854,10 @@ int main(int argc, char *argv[])
         printf("Reduce %d threads (to %d CPUs)\n", threads, total_cpu);
         threads = total_cpu;
     }
-    printf("%d thread(s) on %d CPU\n", threads, total_cpu);
+    printf("%d thread(s) on %d CPU (%s)\n", threads, total_cpu,
+           pin_threads ? "pinned" : "unpinned");
+    if (!pin_threads)
+        printf("WARNING: threads are unpinned, some benchmarks may migrate across cores\n");
 
     if (NULL != filename)
     {
@@ -881,7 +889,7 @@ int main(int argc, char *argv[])
         }
 
         // TODO: probably want to make this include the file name used
-        memtest(threads, dstbuf, srcbuf, tmpbuf, pmem_bufsize, blocksize, "TEST: FILE");
+        memtest(threads, pin_threads, dstbuf, srcbuf, tmpbuf, pmem_bufsize, blocksize, "TEST: FILE");
 
         free_pmem_buffers(poolbuf);
         poolbuf = NULL;
@@ -892,7 +900,7 @@ int main(int argc, char *argv[])
                                             (void **)&tmpbuf, BLOCKSIZE * threads,
                                             NULL, 0);
 
-    memtest(threads, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, "Test: DRAM");
+    memtest(threads, pin_threads, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, "Test: DRAM");
 
 #ifdef __linux__
     bench_info *bi = NULL;
@@ -927,7 +935,7 @@ int main(int argc, char *argv[])
         srcbuf = fbbuf;
         if (bufsize > fbsize)
             bufsize = fbsize;
-        bandwidth_bench(1, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, " ", bi);
+        bandwidth_bench(1, pin_threads, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, " ", bi);
     }
     /* TODO: add get_avx2_framebuffer_benchmarks and get_avx512_framebuffer_benchmarks */
 #endif
