@@ -307,9 +307,13 @@ void memset_wrapper(int64_t *dst, int64_t *src, size_t size)
     memset(dst, src[0], size);
 }
 
-static bench_info c_benchmarks[] =
+static bench_info c_stream_benchmarks[] =
     {
         {"C stream copy", 0, stream_copy},
+        {NULL, 0, NULL}};
+
+static bench_info c_benchmarks[] =
+    {
         {"C copy backwards", 0, aligned_block_copy_backwards},
         {"C copy backwards (32 byte blocks)", 0, aligned_block_copy_backwards_bs32},
         {"C copy backwards (64 byte blocks)", 0, aligned_block_copy_backwards_bs64},
@@ -705,6 +709,8 @@ static void memtest(int threads, int pin, void *dstbuf, void *srcbuf, void *tmpb
     printf("==         brackets                                                     ==\n");
     printf("==========================================================================\n\n");
 
+    if (pin)
+        bandwidth_bench(threads, pin, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, " ", c_stream_benchmarks);
     bandwidth_bench(threads, pin, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, " ", c_benchmarks);
     printf(" ---\n");
     bandwidth_bench(threads, pin, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, " ", libc_benchmarks);
@@ -856,8 +862,6 @@ int main(int argc, char *argv[])
     }
     printf("%d thread(s) on %d CPU (%s)\n", threads, total_cpu,
            pin_threads ? "pinned" : "unpinned");
-    if (!pin_threads)
-        printf("WARNING: threads are unpinned, some benchmarks may migrate across cores\n");
 
     if (NULL != filename)
     {
