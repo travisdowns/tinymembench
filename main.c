@@ -103,6 +103,77 @@ typedef struct
     double dual_ns;
 } json_latency_result;
 
+/*
+ * When -B is given, only the bandwidth benchmarks named in it are run. The
+ * match is exact rather than a substring so that a harness asking for one
+ * benchmark can never silently start measuring a neighbouring one, and names
+ * which match nothing are reported as an error rather than ignored.
+ */
+#define BENCH_FILTER_MAX 32
+
+static char *bench_filter_names[BENCH_FILTER_MAX];
+static int bench_filter_matched[BENCH_FILTER_MAX];
+static int bench_filter_count = 0;
+
+static void bench_filter_init(const char *list)
+{
+    char *p, *copy = strdup(list);
+
+    if (!copy)
+    {
+        fprintf(stderr, "%s: out of memory\n", progname);
+        exit(EXIT_FAILURE);
+    }
+
+    for (p = strtok(copy, ","); p; p = strtok(NULL, ","))
+    {
+        if (bench_filter_count == BENCH_FILTER_MAX)
+        {
+            fprintf(stderr, "%s: at most %d benchmarks may be selected\n",
+                    progname, BENCH_FILTER_MAX);
+            exit(EXIT_FAILURE);
+        }
+        bench_filter_names[bench_filter_count++] = p;
+    }
+}
+
+static int bench_selected(const char *description)
+{
+    int i;
+
+    if (bench_filter_count == 0)
+        return 1;
+
+    for (i = 0; i < bench_filter_count; i++)
+    {
+        if (strcmp(bench_filter_names[i], description) == 0)
+        {
+            bench_filter_matched[i] = 1;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* Complains about every selected name which never matched, and counts them. */
+static int bench_filter_unmatched(void)
+{
+    int i, unmatched = 0;
+
+    for (i = 0; i < bench_filter_count; i++)
+    {
+        if (!bench_filter_matched[i])
+        {
+            fprintf(stderr, "%s: no benchmark named '%s'\n",
+                    progname, bench_filter_names[i]);
+            unmatched++;
+        }
+    }
+
+    return unmatched;
+}
+
 /* Which section a result belongs to, set before each phase of the run. */
 static const char *json_group = "dram";
 static const char *json_variant = "default";
@@ -516,12 +587,13 @@ void bandwidth_bench(int threads, int pin,
 {
     while (bi->f)
     {
-        bandwidth_bench_helper(threads, pin,
-                               dstbuf, srcbuf, tmpbuf,
-                               size, blocksize,
-                               indent_prefix, bi->use_tmpbuf,
-                               bi->f,
-                               bi->description);
+        if (bench_selected(bi->description))
+            bandwidth_bench_helper(threads, pin,
+                                   dstbuf, srcbuf, tmpbuf,
+                                   size, blocksize,
+                                   indent_prefix, bi->use_tmpbuf,
+                                   bi->f,
+                                   bi->description);
         bi++;
     }
 }
@@ -934,6 +1006,8 @@ usage()
     fprintf(stderr, "\t-t Thread count, 0 means %ld (max)\n", sysconf(_SC_NPROCESSORS_ONLN));
     fprintf(stderr, "\t-u Run without pinning threads to CPUs\n");
     fprintf(stderr, "\t-j Also write the results as JSON to <file> ('-' for stdout)\n");
+    fprintf(stderr, "\t-B Run only the named bandwidth benchmarks (comma separated, exact names)\n");
+    fprintf(stderr, "\t-L Skip the memory latency test\n");
     exit(EXIT_FAILURE);
 }
 
@@ -964,6 +1038,7 @@ int main(int argc, char *argv[])
     const char *filename = NULL; // for DAX
     const char *json_path = NULL;
     size_t json_bufsize;
+    int run_latency = 1;
     int memfd = -1;
     int total_cpu = sysconf(_SC_NPROCESSORS_ONLN);
     int threads = -1;
@@ -983,10 +1058,12 @@ int main(int argc, char *argv[])
             {"run_avx2", no_argument, &run_avx2, 1},
             {"run_avx512", no_argument, &run_avx512, 1},
             {"json", required_argument, NULL, 'j'},
+            {"bench", required_argument, NULL, 'B'},
+            {"no-latency", no_argument, NULL, 'L'},
             {0, 0, 0, 0}};
         /* getopt_long stores the option index here. */
         int option_index = 0;
-        c = getopt_long(argc, argv, "hb:c:l:s:m:t:uj:", long_options, &option_index);
+        c = getopt_long(argc, argv, "hb:c:l:s:m:t:uj:B:L", long_options, &option_index);
         if (c == -1)
             break;
         switch (c)
@@ -1022,6 +1099,12 @@ int main(int argc, char *argv[])
             break;
         case 'j':
             json_path = optarg;
+            break;
+        case 'B':
+            bench_filter_init(optarg);
+            break;
+        case 'L':
+            run_latency = 0;
             break;
         case 'h':
         default:
@@ -1140,7 +1223,7 @@ int main(int argc, char *argv[])
 
     free(poolbuf);
 
-    if (NULL != filename)
+    if (run_latency && NULL != filename)
     {
         if (-1 == memfd)
         {
@@ -1159,6 +1242,9 @@ int main(int argc, char *argv[])
             printf("pmem_latency_bench failed\n");
         }
     }
+
+    if (!run_latency)
+        goto done;
 
     printf("\n");
     printf("==========================================================================\n");
@@ -1189,6 +1275,10 @@ int main(int argc, char *argv[])
     {
         latency_bench(latbench_size, latbench_count, 0);
     }
+
+done:
+    if (bench_filter_unmatched() != 0)
+        return 1;
 
     if (json_path && !json_write(json_path, threads, pin_threads, json_bufsize,
                                  blocksize, latbench_size, latbench_count))
