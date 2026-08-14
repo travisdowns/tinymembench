@@ -171,6 +171,27 @@ asm_function aligned_block_fill_stnp_q_aarch64
     ret
 .endfunc
 
+asm_function aligned_block_read_ldp_q_aarch64
+0:
+    ldp         q0,  q1, [SRC, #(0 * 32)]
+    ldp         q2,  q3, [SRC, #(1 * 32)]
+    add         SRC, SRC, #64
+    subs        SIZE, SIZE, #64
+    bgt         0b
+    ret
+.endfunc
+
+asm_function aligned_block_read_ldp_q_pf64_l2strm_aarch64
+0:
+    prfm        pldl2strm, [SRC, #(PREFETCH_DISTANCE)]
+    ldp         q0,  q1, [SRC, #(0 * 32)]
+    ldp         q2,  q3, [SRC, #(1 * 32)]
+    add         SRC, SRC, #64
+    subs        SIZE, SIZE, #64
+    bgt         0b
+    ret
+.endfunc
+
 asm_function aligned_block_copy_ld1st1_aarch64
 0:
     ld1         {v0.16b, v1.16b, v2.16b, v3.16b}, [SRC]

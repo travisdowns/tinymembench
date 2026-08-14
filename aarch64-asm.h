@@ -41,6 +41,13 @@ void aligned_block_copy_ld1st1_aarch64(int64_t *dst,
                                        int64_t *src,
                                        size_t   size);
 
+void aligned_block_read_ldp_q_aarch64(int64_t *dst,
+                                      int64_t *src,
+                                      size_t   size);
+void aligned_block_read_ldp_q_pf64_l2strm_aarch64(int64_t *dst,
+                                                  int64_t *src,
+                                                  size_t   size);
+
 void aligned_block_copy_ldpstp_q_pf32_l2strm_aarch64(int64_t *dst,
                                                      int64_t *src,
                                                      size_t   size);

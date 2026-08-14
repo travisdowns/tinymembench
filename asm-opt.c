@@ -457,6 +457,8 @@ bench_info *get_avx512_framebuffer_benchmarks(void) { return empty; }
 
 static bench_info aarch64_neon[] =
     {
+        {"NEON LDP read", 0, aligned_block_read_ldp_q_aarch64},
+        {"NEON LDP read pldl2strm (64 bytes step)", 0, aligned_block_read_ldp_q_pf64_l2strm_aarch64},
         {"NEON LDP/STP copy", 0, aligned_block_copy_ldpstp_q_aarch64},
         {"NEON LDP/STP copy pldl2strm (32 bytes step)", 0, aligned_block_copy_ldpstp_q_pf32_l2strm_aarch64},
         {"NEON LDP/STP copy pldl2strm (64 bytes step)", 0, aligned_block_copy_ldpstp_q_pf64_l2strm_aarch64},
