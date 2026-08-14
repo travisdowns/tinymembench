@@ -62,6 +62,176 @@
 
 char *progname;
 
+#if defined(__aarch64__)
+#define ARCH_NAME "aarch64"
+#elif defined(__amd64__) || defined(__x86_64__)
+#define ARCH_NAME "x86_64"
+#elif defined(__i386__)
+#define ARCH_NAME "i386"
+#elif defined(__arm__)
+#define ARCH_NAME "arm"
+#elif defined(__mips__)
+#define ARCH_NAME "mips"
+#else
+#define ARCH_NAME "unknown"
+#endif
+
+/*
+ * Machine readable output. Results are collected as they are printed and the
+ * whole document is written out once at the end of the run, so the emitter
+ * needs no incremental bracket bookkeeping. Every string stored here is a
+ * string literal, so the pointers stay valid without copying.
+ */
+#define JSON_MAX_RESULTS 512
+
+typedef struct
+{
+    const char *group;
+    const char *description;
+    int threads;
+    int use_tmpbuf;
+    double speed;
+    double sd_percent;
+} json_bandwidth_result;
+
+typedef struct
+{
+    const char *group;
+    const char *variant;
+    int block_size;
+    double single_ns;
+    double dual_ns;
+} json_latency_result;
+
+/* Which section a result belongs to, set before each phase of the run. */
+static const char *json_group = "dram";
+static const char *json_variant = "default";
+
+static json_bandwidth_result json_bandwidth[JSON_MAX_RESULTS];
+static json_latency_result json_latency[JSON_MAX_RESULTS];
+static int json_bandwidth_count = 0;
+static int json_latency_count = 0;
+
+static void json_add_bandwidth(const char *description, int threads,
+                               int use_tmpbuf, double speed, double sd_percent)
+{
+    json_bandwidth_result *r;
+
+    if (json_bandwidth_count >= JSON_MAX_RESULTS)
+        return;
+
+    r = json_bandwidth + json_bandwidth_count++;
+    r->group = json_group;
+    r->description = description;
+    /* the 2-pass benchmarks are always driven by a single thread */
+    r->threads = use_tmpbuf ? 1 : threads;
+    r->use_tmpbuf = use_tmpbuf;
+    r->speed = speed;
+    r->sd_percent = sd_percent;
+}
+
+static void json_add_latency(int block_size, double single_ns, double dual_ns)
+{
+    json_latency_result *r;
+
+    if (json_latency_count >= JSON_MAX_RESULTS)
+        return;
+
+    r = json_latency + json_latency_count++;
+    r->group = json_group;
+    r->variant = json_variant;
+    r->block_size = block_size;
+    r->single_ns = single_ns;
+    r->dual_ns = dual_ns;
+}
+
+static void json_print_string(FILE *f, const char *s)
+{
+    fputc('"', f);
+    for (; *s; s++)
+    {
+        if (*s == '"' || *s == '\\')
+            fprintf(f, "\\%c", *s);
+        else if ((unsigned char)*s < 0x20)
+            fprintf(f, "\\u%04x", (unsigned char)*s);
+        else
+            fputc(*s, f);
+    }
+    fputc('"', f);
+}
+
+static int json_write(const char *path, int threads, int pin,
+                      size_t bufsize, int blocksize,
+                      size_t latbench_size, int latbench_count)
+{
+    FILE *f;
+    int i;
+
+    if (strcmp(path, "-") == 0)
+    {
+        f = stdout;
+    }
+    else if (!(f = fopen(path, "w")))
+    {
+        fprintf(stderr, "%s: unable to open %s for writing\n", progname, path);
+        return 0;
+    }
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"version\": \"" VERSION "\",\n");
+    fprintf(f, "  \"arch\": \"" ARCH_NAME "\",\n");
+    fprintf(f, "  \"threads\": %d,\n", threads);
+    fprintf(f, "  \"pinned\": %s,\n", pin ? "true" : "false");
+    fprintf(f, "  \"cpus_online\": %ld,\n", sysconf(_SC_NPROCESSORS_ONLN));
+    fprintf(f, "  \"buffer_size\": %zu,\n", bufsize);
+    fprintf(f, "  \"block_size\": %d,\n", blocksize);
+    fprintf(f, "  \"latency_size\": %zu,\n", latbench_size);
+    fprintf(f, "  \"latency_count\": %d,\n", latbench_count);
+
+    fprintf(f, "  \"bandwidth\": [\n");
+    for (i = 0; i < json_bandwidth_count; i++)
+    {
+        json_bandwidth_result *r = json_bandwidth + i;
+        fprintf(f, "    {\"group\": ");
+        json_print_string(f, r->group);
+        fprintf(f, ", \"name\": ");
+        json_print_string(f, r->description);
+        fprintf(f, ", \"threads\": %d, \"two_pass\": %s",
+                r->threads, r->use_tmpbuf ? "true" : "false");
+        fprintf(f, ", \"mb_per_s\": %.1f, \"sd_percent\": %.3f}%s\n",
+                r->speed, r->sd_percent,
+                i + 1 < json_bandwidth_count ? "," : "");
+    }
+    fprintf(f, "  ],\n");
+
+    fprintf(f, "  \"latency\": [\n");
+    for (i = 0; i < json_latency_count; i++)
+    {
+        json_latency_result *r = json_latency + i;
+        fprintf(f, "    {\"group\": ");
+        json_print_string(f, r->group);
+        fprintf(f, ", \"variant\": ");
+        json_print_string(f, r->variant);
+        fprintf(f, ", \"block_size\": %d", r->block_size);
+        fprintf(f, ", \"single_read_ns\": %.1f, \"dual_read_ns\": %.1f}%s\n",
+                r->single_ns, r->dual_ns,
+                i + 1 < json_latency_count ? "," : "");
+    }
+    fprintf(f, "  ]\n");
+    fprintf(f, "}\n");
+
+    if (f == stdout)
+        return fflush(f) == 0;
+
+    if (fclose(f) != 0)
+    {
+        fprintf(stderr, "%s: error writing %s\n", progname, path);
+        return 0;
+    }
+
+    return 1;
+}
+
 #ifdef __linux__
 static void *mmap_framebuffer(size_t *fbsize)
 {
@@ -279,6 +449,9 @@ static double bandwidth_bench_helper(int threads, int pin,
                 break;
         }
     }
+
+    json_add_bandwidth(description, threads, use_tmpbuf, maxspeed,
+                       maxspeed > 0 ? s / maxspeed * 100. : 0.);
 
     if (maxspeed > 0 && s / maxspeed * 100. >= 0.1)
     {
@@ -620,6 +793,8 @@ static void latency_bench_with_buffer(void *buffer, size_t size, int count, cons
         }
         printf("%10d : %6.1f ns          /  %6.1f ns \n", (1 << nbits),
                min_t * 1000000000. / count, min_t2 * 1000000000. / count);
+        json_add_latency(1 << nbits, min_t * 1000000000. / count,
+                         min_t2 * 1000000000. / count);
     }
 }
 
@@ -640,7 +815,10 @@ static int pmem_latency_bench(size_t size, int count, int memfd)
         exit(1);
     }
 
+    json_group = "pmem";
+    json_variant = "file";
     latency_bench_with_buffer(buffer, size, count, ", [Using File]");
+    json_group = "dram";
 
     free_pmem_buffers(poolbuf);
     poolbuf = NULL;
@@ -671,14 +849,17 @@ int latency_bench(size_t size, int count, int use_hugepage)
 #endif
     if (use_hugepage > 0)
     {
+        json_variant = "hugepage";
         latency_bench_with_buffer(buffer, size, count, ", [MADV_HUGEPAGE]");
     }
     else if (use_hugepage < 0)
     {
+        json_variant = "nohugepage";
         latency_bench_with_buffer(buffer, size, count, ", [MADV_NOHUGEPAGE]");
     }
     else
     {
+        json_variant = "default";
         latency_bench_with_buffer(buffer, size, count, "");
     }
     free(buffer_alloc);
@@ -740,7 +921,7 @@ static void memtest(int threads, int pin, void *dstbuf, void *srcbuf, void *tmpb
 static void
 usage()
 {
-    fprintf(stderr, "usage: %s [-s buffer size -b blocksize -l latency max size -c latency count]\n",
+    fprintf(stderr, "usage: %s [-s buffer size -b blocksize -l latency max size -c latency count -j json file]\n",
             progname);
     fprintf(stderr, "\t-b Memory blocksize in Bytes <%d>\n", BLOCKSIZE);
     fprintf(stderr, "\t-s Memory buffer size in Bytes <%d>\n", SIZE);
@@ -752,6 +933,7 @@ usage()
     // fprintf(stderr, "\t--run_sse Include AVX512 tests <false>\n");
     fprintf(stderr, "\t-t Thread count, 0 means %ld (max)\n", sysconf(_SC_NPROCESSORS_ONLN));
     fprintf(stderr, "\t-u Run without pinning threads to CPUs\n");
+    fprintf(stderr, "\t-j Also write the results as JSON to <file> ('-' for stdout)\n");
     exit(EXIT_FAILURE);
 }
 
@@ -780,6 +962,8 @@ int main(int argc, char *argv[])
     void *poolbuf = NULL;
     int64_t *srcbuf, *dstbuf, *tmpbuf;
     const char *filename = NULL; // for DAX
+    const char *json_path = NULL;
+    size_t json_bufsize;
     int memfd = -1;
     int total_cpu = sysconf(_SC_NPROCESSORS_ONLN);
     int threads = -1;
@@ -798,10 +982,11 @@ int main(int argc, char *argv[])
             {"run_sse2", no_argument, &run_sse2, 1},
             {"run_avx2", no_argument, &run_avx2, 1},
             {"run_avx512", no_argument, &run_avx512, 1},
+            {"json", required_argument, NULL, 'j'},
             {0, 0, 0, 0}};
         /* getopt_long stores the option index here. */
         int option_index = 0;
-        c = getopt_long(argc, argv, "hb:c:l:s:m:t:u", long_options, &option_index);
+        c = getopt_long(argc, argv, "hb:c:l:s:m:t:uj:", long_options, &option_index);
         if (c == -1)
             break;
         switch (c)
@@ -834,6 +1019,9 @@ int main(int argc, char *argv[])
             break;
         case 'u':
             pin_threads = 0;
+            break;
+        case 'j':
+            json_path = optarg;
             break;
         case 'h':
         default:
@@ -893,7 +1081,9 @@ int main(int argc, char *argv[])
         }
 
         // TODO: probably want to make this include the file name used
+        json_group = "pmem";
         memtest(threads, pin_threads, dstbuf, srcbuf, tmpbuf, pmem_bufsize, blocksize, "TEST: FILE");
+        json_group = "dram";
 
         free_pmem_buffers(poolbuf);
         poolbuf = NULL;
@@ -904,6 +1094,8 @@ int main(int argc, char *argv[])
                                             (void **)&tmpbuf, BLOCKSIZE * threads,
                                             NULL, 0);
 
+    /* bufsize is clamped below by the framebuffer test, so remember it here */
+    json_bufsize = bufsize;
     memtest(threads, pin_threads, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, "Test: DRAM");
 
 #ifdef __linux__
@@ -939,7 +1131,9 @@ int main(int argc, char *argv[])
         srcbuf = fbbuf;
         if (bufsize > fbsize)
             bufsize = fbsize;
+        json_group = "framebuffer";
         bandwidth_bench(1, pin_threads, dstbuf, srcbuf, tmpbuf, bufsize, blocksize, " ", bi);
+        json_group = "dram";
     }
     /* TODO: add get_avx2_framebuffer_benchmarks and get_avx512_framebuffer_benchmarks */
 #endif
@@ -994,6 +1188,12 @@ int main(int argc, char *argv[])
         !latency_bench(latbench_size, latbench_count, 1))
     {
         latency_bench(latbench_size, latbench_count, 0);
+    }
+
+    if (json_path && !json_write(json_path, threads, pin_threads, json_bufsize,
+                                 blocksize, latbench_size, latbench_count))
+    {
+        return 1;
     }
 
     return 0;
