@@ -512,13 +512,14 @@ static void parallel_init(int threads, int pin)
 static double bandwidth_bench_helper(int threads, int pin,
                                      int64_t *dstbuf, int64_t *srcbuf,
                                      int64_t *tmpbuf,
-                                     int size, int blocksize,
+                                     size_t size, size_t blocksize,
                                      const char *indent_prefix,
                                      int use_tmpbuf,
                                      void (*f)(int64_t *, int64_t *, size_t),
                                      const char *description)
 {
-    int i, j, loopcount, innerloopcount, n;
+    int i, loopcount, innerloopcount, n;
+    size_t j;
     double t, t1, t2;
     double speed, maxspeed;
     double s, s0, s1, s2;
@@ -671,7 +672,7 @@ static bench_info libc_benchmarks[] =
 
 void bandwidth_bench(int threads, int pin,
                      int64_t *dstbuf, int64_t *srcbuf, int64_t *tmpbuf,
-                     int size, int blocksize, const char *indent_prefix,
+                     size_t size, size_t blocksize, const char *indent_prefix,
                      bench_info *bi)
 {
     while (bi->f)
@@ -1300,10 +1301,10 @@ int main(int argc, char *argv[])
             latbench_count = atoi(optarg);
             break;
         case 'l':
-            latbench_size = atoi(optarg);
+            latbench_size = (size_t)strtoull(optarg, NULL, 0);
             break;
         case 's':
-            bufsize = atoi(optarg);
+            bufsize = (size_t)strtoull(optarg, NULL, 0);
             break;
         case 'm':
             filename = strdup(optarg);
