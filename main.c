@@ -252,7 +252,8 @@ static void json_add_bandwidth(const char *description, int threads,
     r->sd_percent = sd_percent;
 }
 
-static void json_add_sweep(const sweep_result *r)
+static void json_add_sweep(size_t size, int threads, int trial,
+                           double lat_ns, double bw_gbs)
 {
     json_sweep_result *out;
 
@@ -260,11 +261,11 @@ static void json_add_sweep(const sweep_result *r)
         return;
 
     out = json_sweep + json_sweep_count++;
-    out->size    = r->size;
-    out->threads = r->threads;
-    out->trial   = r->trial;
-    out->lat_ns  = r->lat_ns;
-    out->bw_gbs  = r->bw_gbs;
+    out->size    = size;
+    out->threads = threads;
+    out->trial   = trial;
+    out->lat_ns  = lat_ns;
+    out->bw_gbs  = bw_gbs;
 }
 
 static void json_add_latency(int block_size, double single_ns, double dual_ns)
@@ -1097,6 +1098,7 @@ usage()
     fprintf(stderr, "\t-B Run only the named bandwidth benchmarks (comma separated, exact names)\n");
     fprintf(stderr, "\t-L Skip the memory latency test\n");
     fprintf(stderr, "\t-S Run the working set sweep instead of the standard benchmarks\n");
+    fprintf(stderr, "\t   Footprints run from 512 KiB up to -l, trials use --sweep-trials.\n");
     fprintf(stderr, "\t   --sweep-trials <n> repeats per footprint <10>\n");
     fprintf(stderr, "\t   --sweep-hops <n>   timed loads per thread per trial <1000000>\n");
     fprintf(stderr, "\t   --sweep-warm <n>   cap on warm-pass loads, 0 for a full pass <2000000>\n");
@@ -1117,10 +1119,22 @@ static void set_linux_fifo_scheduler()
 #endif
 
 /*
- * Prints one line per footprint with the median across trials, which is what a
- * human reads the sweep for. Every individual trial still reaches the JSON, so a
- * harness can compute its own dispersion.
+ * Working set sweep, placed next to latency_bench because it answers the
+ * question that one cannot: how much cache this process actually gets. It walks
+ * a ladder of footprints and reports the cycle chase latency and streaming read
+ * bandwidth at each, so the footprint where latency leaves its plateau is
+ * visible. latency_bench masks a pseudorandom address, which restricts it to
+ * power of two footprints and cannot sample between 32 and 64 MiB where a last
+ * level cache boundary lands.
+ *
+ * The ladder is bounded by -l, so the same flag sizes both latency tests.
  */
+static const size_t sweep_ladder_kib[] = {
+    512, 1024, 2048, 4096, 6144, 8192, 12288, 16384, 20480, 24576, 28672,
+    32768, 36864, 40960, 49152, 65536, 81920, 98304, 131072, 196608, 262144,
+    524288, 1048576
+};
+
 static int sweep_cmp_double(const void *a, const void *b)
 {
     double x = *(const double *)a, y = *(const double *)b;
@@ -1133,96 +1147,87 @@ static double sweep_median(double *v, int n)
     return n & 1 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
 }
 
-typedef struct
+#define SWEEP_MAX_TRIALS 256
+
+static int sweep_bench(int threads, int pin, size_t max_size, int trials,
+                       long hops, long warm)
 {
-    size_t size;
-    int    threads;
-    int    count;
-    double lat[256];
-    double bw[256];
-} sweep_accum;
+    int pages = page_mode_set ? page_mode : 1;
+    size_t i;
 
-static void sweep_flush(sweep_accum *a)
-{
-    double lat, bw;
+    if (trials < 1)
+        trials = 1;
+    if (trials > SWEEP_MAX_TRIALS)
+        trials = SWEEP_MAX_TRIALS;
 
-    if (a->count == 0)
-        return;
-
-    lat = sweep_median(a->lat, a->count);
-    bw = sweep_median(a->bw, a->count);
-    if (a->size >= 1024 * 1024)
-        printf("%8zu MiB", a->size / (1024 * 1024));
-    else
-        printf("%8zu KiB", a->size / 1024);
-    printf(" : %8.1f ns  %10.1f MB/s", lat, bw * 1000.0);
-    if (a->threads > 1)
-        printf("  @ %d threads, %zu KiB each", a->threads,
-               a->size / (size_t)a->threads / 1024);
-    printf("\n");
-    a->count = 0;
-}
-
-static int sweep_report(const sweep_result *r, void *ctx)
-{
-    sweep_accum *a = (sweep_accum *)ctx;
-
-    if (a->count > 0 && (r->size != a->size || r->threads != a->threads))
-        sweep_flush(a);
-    a->size = r->size;
-    a->threads = r->threads;
-    if (a->count < (int)(sizeof(a->lat) / sizeof(a->lat[0])))
-    {
-        a->lat[a->count] = r->lat_ns;
-        a->bw[a->count] = r->bw_gbs;
-        a->count++;
-    }
-    json_add_sweep(r);
-    return 1;
-}
-
-static int sweep_bench(int threads, int pin, int trials, long hops, long warm)
-{
-    sweep_config cfg;
-    sweep_accum acc;
-    int rc;
-
-    sweep_defaults(&cfg);
-    cfg.threads = threads;
-    cfg.pin = pin;
-    if (trials > 0)
-        cfg.trials = trials;
-    if (hops > 0)
-        cfg.hops = hops;
-    if (warm >= 0)
-        cfg.warm_hops = warm;
-    /* Hugepages unless told otherwise: with 4 KiB pages the page walk dominates
-     * and the curve reports the TLB instead of the cache. */
-    cfg.hugepages = page_mode_set ? page_mode : 1;
-
-    memset(&acc, 0, sizeof(acc));
     printf("\n");
     printf("==========================================================================\n");
-    printf("== Working set sweep: dependent-load latency and streaming read         ==\n");
-    printf("== bandwidth against footprint. Latency walks a single cycle covering    ==\n");
-    printf("== every line once, so the footprint where it leaves its plateau is the  ==\n");
-    printf("== cache this process actually gets, which on a shared socket can be a   ==\n");
-    printf("== fraction of the size the CPU advertises.                              ==\n");
+    printf("== Working set sweep. Latency is a dependent load chase around a cycle   ==\n");
+    printf("== covering every line of the footprint exactly once, so the size where  ==\n");
+    printf("== it leaves its plateau is the cache this process really gets, which on ==\n");
+    printf("== a shared socket can be a fraction of what the CPU advertises.         ==\n");
     printf("==                                                                      ==\n");
-    printf("== With several threads the footprint is split into private slices, so    ==\n");
-    printf("== the figure is aggregate pressure and a slice may fit a private cache. ==\n");
+    printf("== With several threads the footprint is split into private slices, so   ==\n");
+    printf("== a row is aggregate pressure and a slice may fit a private cache.      ==\n");
+    printf("== pages: %-62s ==\n",
+           pages > 0 ? "MADV_HUGEPAGE"
+                     : (pages < 0 ? "MADV_NOHUGEPAGE, expect the TLB not the cache"
+                                  : "system default"));
     printf("==========================================================================\n");
-    printf("== pages: %-63s ==\n",
-           cfg.hugepages > 0 ? "MADV_HUGEPAGE"
-                             : (cfg.hugepages < 0
-                                    ? "MADV_NOHUGEPAGE, expect the TLB not the cache"
-                                    : "system default"));
-    printf("==========================================================================\n");
-    printf("%12s : %8s     %10s\n", "footprint", "latency", "bandwidth");
+    printf("%12s : %9s   %12s%s\n", "footprint", "latency", "read",
+           threads > 1 ? "   per thread" : "");
 
-    rc = sweep_run(&cfg, sweep_report, &acc);
-    sweep_flush(&acc);
-    return rc >= 0;
+    for (i = 0; i < sizeof(sweep_ladder_kib) / sizeof(sweep_ladder_kib[0]); i++)
+    {
+        size_t bytes = sweep_ladder_kib[i] * 1024;
+        size_t slice = sweep_slice(bytes, threads);
+        double lat[SWEEP_MAX_TRIALS], bw[SWEEP_MAX_TRIALS];
+        char *buf;
+        int reps, trial;
+
+        if (max_size && bytes > max_size)
+            continue;
+        /* A slice this small says more about the L1 than about anything shared. */
+        if (slice < 256 * 1024)
+            continue;
+
+        if (!(buf = sweep_alloc(bytes, threads, pages)))
+        {
+            fprintf(stderr, "%s: cannot allocate %zu bytes for the sweep\n",
+                    progname, bytes);
+            return 0;
+        }
+
+        reps = (int)(1073741824UL / slice);
+        if (reps < 3)
+            reps = 3;
+
+        for (trial = 0; trial < trials; trial++)
+        {
+            bw[trial] = sweep_read_gbs(buf, bytes, threads, pin, reps);
+            lat[trial] = sweep_chase_ns(buf, bytes, threads, pin, hops, warm);
+            if (bw[trial] < 0 || lat[trial] < 0)
+            {
+                sweep_free(buf, bytes);
+                fprintf(stderr, "%s: unable to start %d sweep threads\n",
+                        progname, threads);
+                return 0;
+            }
+            json_add_sweep(bytes, threads, trial + 1, lat[trial], bw[trial]);
+        }
+        sweep_free(buf, bytes);
+
+        if (bytes >= 1024 * 1024)
+            printf("%8zu MiB", bytes / (1024 * 1024));
+        else
+            printf("%8zu KiB", bytes / 1024);
+        printf(" : %6.1f ns   %9.1f MB/s",
+               sweep_median(lat, trials), sweep_median(bw, trials) * 1000.0);
+        if (threads > 1)
+            printf("   %zu KiB", slice / 1024);
+        printf("\n");
+    }
+    return 1;
 }
 
 int main(int argc, char *argv[])
@@ -1241,7 +1246,7 @@ int main(int argc, char *argv[])
     const char *filename = NULL; // for DAX
     const char *json_path = NULL;
     int run_sweep = 0;
-    int sweep_trials = 0;
+    int sweep_trials = 10;
     long sweep_hops = 0;
     long sweep_warm = -1;
     size_t json_bufsize;
@@ -1375,8 +1380,9 @@ int main(int argc, char *argv[])
 
     if (run_sweep)
     {
-        int ok = sweep_bench(threads, pin_threads, sweep_trials, sweep_hops,
-                             sweep_warm);
+        int ok = sweep_bench(threads, pin_threads, latbench_size, sweep_trials,
+                             sweep_hops > 0 ? sweep_hops : 1000000,
+                             sweep_warm >= 0 ? sweep_warm : 2000000);
 
         if (ok && json_path)
             ok = json_write(json_path, threads, pin_threads, bufsize, blocksize,

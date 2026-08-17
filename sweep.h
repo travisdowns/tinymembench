@@ -1,13 +1,18 @@
 /*
- * Working-set sweep: dependent-load latency and streaming read bandwidth
- * measured across a ladder of footprints, at a chosen thread count.
+ * Measurement primitives for the working set sweep in main.c.
  *
- * The point of the sweep is to locate cache boundaries rather than to report a
- * single number for one buffer size, which is what the bandwidth and latency
- * benchmarks in main.c do. On a machine whose last level cache is shared with
- * other tenants, the footprint at which latency leaves its plateau measures how
- * much of that cache this tenant actually has, which can be a small fraction of
- * the size the CPU advertises.
+ * These exist because the latency test there cannot answer how much cache a
+ * process actually gets. Its address generator masks a pseudorandom value, so
+ * its footprints are powers of two and it cannot sample between 32 and 64 MiB
+ * where a last level cache boundary lands; it also draws addresses with
+ * replacement and runs on one thread.
+ *
+ * A chase around a cycle that covers every line exactly once gives an exact
+ * working set at any size, one dependent load per hop, and no address
+ * arithmetic in the timed loop. Linking a shuffled visiting order end to end
+ * guarantees a single cycle; pointing each line at an independently chosen
+ * random line would produce several disjoint cycles, and a chase that fell into
+ * a short one would stay cache resident and look fast at every footprint.
  */
 
 #ifndef __SWEEP_H__
@@ -15,35 +20,37 @@
 
 #include <stddef.h>
 
-typedef struct
-{
-    size_t size;      /* aggregate footprint in bytes, summed over threads */
-    int    threads;
-    int    trial;     /* 1-based */
-    double lat_ns;    /* mean per-thread dependent-load latency */
-    double bw_gbs;    /* aggregate streaming read bandwidth, GB/s */
-} sweep_result;
+/*
+ * Allocates a buffer of the given size and lays an independent cycle inside
+ * each of the per-thread slices it will be split into. hugepages is 1 for
+ * MADV_HUGEPAGE, -1 for MADV_NOHUGEPAGE, 0 for system policy. Returns NULL on
+ * failure.
+ */
+char *sweep_alloc(size_t bytes, int threads, int hugepages);
+void  sweep_free(char *buf, size_t bytes);
 
-typedef struct
-{
-    int  threads;     /* <= 0 means every online cpu */
-    int  pin;         /* pin thread i to cpu i */
-    int  trials;      /* repeats per footprint */
-    long hops;        /* timed dependent loads per thread per trial */
-    long warm_hops;   /* cap on the warm pass; <= 0 means a full traversal */
-    int  hugepages;   /* 1 = MADV_HUGEPAGE, -1 = MADV_NOHUGEPAGE, 0 = default */
-    size_t min_size;  /* skip footprints below this, 0 for the default ladder */
-    size_t max_size;  /* skip footprints above this, 0 for no limit */
-} sweep_config;
+/* Bytes each thread walks, given the aggregate footprint and thread count. */
+size_t sweep_slice(size_t bytes, int threads);
 
 /*
- * Runs the sweep, calling emit() once per (footprint, trial). emit() returning
- * zero aborts the sweep. Returns the number of results emitted, or -1 on error.
+ * Both measurements split the footprint into private per-thread slices and
+ * release the threads from a barrier so they apply pressure at the same time,
+ * so a footprint is aggregate pressure on the shared cache levels rather than
+ * the size any one thread walks.
+ *
+ * sweep_chase_ns returns the mean per-thread dependent load latency in ns.
+ * warm caps the untimed pass: <= 0 walks the whole slice, which costs one
+ * footprint of misses per call and dominates a large run, while a couple of
+ * cache fills reach the same steady state.
+ *
+ * sweep_read_gbs returns aggregate streaming read bandwidth in GB/s, using
+ * eight independent accumulators so the result is not limited by the
+ * dependency chain of the summation.
+ *
+ * Both return a negative value if the threads could not be started.
  */
-int sweep_run(const sweep_config *cfg,
-              int (*emit)(const sweep_result *result, void *ctx), void *ctx);
-
-/* Fills cfg with the defaults documented in the usage text. */
-void sweep_defaults(sweep_config *cfg);
+double sweep_chase_ns(char *buf, size_t bytes, int threads, int pin,
+                      long hops, long warm);
+double sweep_read_gbs(char *buf, size_t bytes, int threads, int pin, int reps);
 
 #endif
