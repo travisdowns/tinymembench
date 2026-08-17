@@ -192,7 +192,42 @@ typedef struct
 
 static json_sweep_result json_sweep[JSON_MAX_SWEEP];
 static int json_sweep_count = 0;
-static const char *json_sweep_pages = "hugepage";
+/*
+ * Page size for every mode: 1 requests MADV_HUGEPAGE, -1 MADV_NOHUGEPAGE, 0
+ * leaves system policy alone. page_mode_set records whether the user asked,
+ * because unasked the latency test measures both variants and the sweep defaults
+ * to hugepages, which is not the same thing as "default".
+ */
+static int page_mode = 0;
+static int page_mode_set = 0;
+
+static const char *page_mode_name(int mode)
+{
+    return mode > 0 ? "hugepage" : (mode < 0 ? "nohugepage" : "default");
+}
+
+/*
+ * madvise() needs a page aligned range, and transparent huge pages only back a
+ * 2 MiB aligned one, so trim to that. The pool comes from malloc and may start
+ * anywhere.
+ */
+static void page_advise(void *base, size_t len)
+{
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    uintptr_t start = ((uintptr_t)base + 0x1FFFFF) & ~(uintptr_t)0x1FFFFF;
+    uintptr_t end = ((uintptr_t)base + len) & ~(uintptr_t)0x1FFFFF;
+
+    if (!page_mode || end <= start)
+        return;
+    if (madvise((void *)start, end - start,
+                page_mode > 0 ? MADV_HUGEPAGE : MADV_NOHUGEPAGE) != 0)
+        fprintf(stderr, "%s: madvise(%s) failed, continuing\n", progname,
+                page_mode_name(page_mode));
+#else
+    (void)base;
+    (void)len;
+#endif
+}
 
 static json_bandwidth_result json_bandwidth[JSON_MAX_RESULTS];
 static json_latency_result json_latency[JSON_MAX_RESULTS];
@@ -289,6 +324,9 @@ static int json_write(const char *path, int threads, int pin,
     fprintf(f, "  \"block_size\": %d,\n", blocksize);
     fprintf(f, "  \"latency_size\": %zu,\n", latbench_size);
     fprintf(f, "  \"latency_count\": %d,\n", latbench_count);
+    fprintf(f, "  \"pages\": ");
+    json_print_string(f, page_mode_set ? page_mode_name(page_mode) : "unset");
+    fprintf(f, ",\n");
 
     fprintf(f, "  \"bandwidth\": [\n");
     for (i = 0; i < json_bandwidth_count; i++)
@@ -323,8 +361,6 @@ static int json_write(const char *path, int threads, int pin,
 
     if (json_sweep_count > 0)
     {
-        fprintf(f, ",\n  \"sweep_pages\": ");
-        json_print_string(f, json_sweep_pages);
         fprintf(f, ",\n  \"sweep\": [\n");
         for (i = 0; i < json_sweep_count; i++)
         {
@@ -1064,7 +1100,8 @@ usage()
     fprintf(stderr, "\t   --sweep-trials <n> repeats per footprint <10>\n");
     fprintf(stderr, "\t   --sweep-hops <n>   timed loads per thread per trial <1000000>\n");
     fprintf(stderr, "\t   --sweep-warm <n>   cap on warm-pass loads, 0 for a full pass <2000000>\n");
-    fprintf(stderr, "\t   --sweep-pages <p>  huge|2m, small|4k, or default <huge>\n");
+    fprintf(stderr, "\t--hugepages <p> Page size for every mode: huge|2m, small|4k, default.\n");
+    fprintf(stderr, "\t                Unset runs the latency test both ways and sweeps with huge.\n");
     exit(EXIT_FAILURE);
 }
 
@@ -1144,8 +1181,7 @@ static int sweep_report(const sweep_result *r, void *ctx)
     return 1;
 }
 
-static int sweep_bench(int threads, int pin, int trials, long hops, long warm,
-                       int pages)
+static int sweep_bench(int threads, int pin, int trials, long hops, long warm)
 {
     sweep_config cfg;
     sweep_accum acc;
@@ -1160,8 +1196,9 @@ static int sweep_bench(int threads, int pin, int trials, long hops, long warm,
         cfg.hops = hops;
     if (warm >= 0)
         cfg.warm_hops = warm;
-    cfg.hugepages = pages;
-    json_sweep_pages = pages > 0 ? "hugepage" : (pages < 0 ? "nohugepage" : "default");
+    /* Hugepages unless told otherwise: with 4 KiB pages the page walk dominates
+     * and the curve reports the TLB instead of the cache. */
+    cfg.hugepages = page_mode_set ? page_mode : 1;
 
     memset(&acc, 0, sizeof(acc));
     printf("\n");
@@ -1176,9 +1213,10 @@ static int sweep_bench(int threads, int pin, int trials, long hops, long warm,
     printf("== the figure is aggregate pressure and a slice may fit a private cache. ==\n");
     printf("==========================================================================\n");
     printf("== pages: %-63s ==\n",
-           pages > 0 ? "MADV_HUGEPAGE. With 4 KiB pages the page walk dominates"
-                     : (pages < 0 ? "MADV_NOHUGEPAGE. Expect the TLB, not the cache, past a few MiB"
-                                  : "system default"));
+           cfg.hugepages > 0 ? "MADV_HUGEPAGE"
+                             : (cfg.hugepages < 0
+                                    ? "MADV_NOHUGEPAGE, expect the TLB not the cache"
+                                    : "system default"));
     printf("==========================================================================\n");
     printf("%12s : %8s     %10s\n", "footprint", "latency", "bandwidth");
 
@@ -1206,7 +1244,6 @@ int main(int argc, char *argv[])
     int sweep_trials = 0;
     long sweep_hops = 0;
     long sweep_warm = -1;
-    int sweep_pages = 1;
     size_t json_bufsize;
     int run_latency = 1;
     int memfd = -1;
@@ -1234,7 +1271,7 @@ int main(int argc, char *argv[])
             {"sweep-trials", required_argument, NULL, 1001},
             {"sweep-hops", required_argument, NULL, 1002},
             {"sweep-warm", required_argument, NULL, 1003},
-            {"sweep-pages", required_argument, NULL, 1004},
+            {"hugepages", required_argument, NULL, 1004},
             {0, 0, 0, 0}};
         /* getopt_long stores the option index here. */
         int option_index = 0;
@@ -1294,15 +1331,16 @@ int main(int argc, char *argv[])
             sweep_warm = atol(optarg);
             break;
         case 1004:
+            page_mode_set = 1;
             if (strcmp(optarg, "huge") == 0 || strcmp(optarg, "2m") == 0)
-                sweep_pages = 1;
+                page_mode = 1;
             else if (strcmp(optarg, "small") == 0 || strcmp(optarg, "4k") == 0)
-                sweep_pages = -1;
+                page_mode = -1;
             else if (strcmp(optarg, "default") == 0)
-                sweep_pages = 0;
+                page_mode = 0;
             else
             {
-                fprintf(stderr, "%s: --sweep-pages expects huge, small or default\n",
+                fprintf(stderr, "%s: --hugepages expects huge, small or default\n",
                         progname);
                 exit(EXIT_FAILURE);
             }
@@ -1338,7 +1376,7 @@ int main(int argc, char *argv[])
     if (run_sweep)
     {
         int ok = sweep_bench(threads, pin_threads, sweep_trials, sweep_hops,
-                             sweep_warm, sweep_pages);
+                             sweep_warm);
 
         if (ok && json_path)
             ok = json_write(json_path, threads, pin_threads, bufsize, blocksize,
@@ -1388,6 +1426,8 @@ int main(int argc, char *argv[])
                                             (void **)&dstbuf, bufsize * threads,
                                             (void **)&tmpbuf, BLOCKSIZE * threads,
                                             NULL, 0);
+    page_advise(poolbuf, (size_t)bufsize * threads * 2 +
+                             (size_t)BLOCKSIZE * threads);
 
     /* bufsize is clamped below by the framebuffer test, so remember it here */
     json_bufsize = bufsize;
@@ -1482,8 +1522,13 @@ int main(int argc, char *argv[])
     printf("==         single reads performed one after another.                    ==\n");
     printf("==========================================================================\n");
 
-    if (!latency_bench(latbench_size, latbench_count, -1) ||
-        !latency_bench(latbench_size, latbench_count, 1))
+    if (page_mode_set)
+    {
+        if (!latency_bench(latbench_size, latbench_count, page_mode))
+            latency_bench(latbench_size, latbench_count, 0);
+    }
+    else if (!latency_bench(latbench_size, latbench_count, -1) ||
+             !latency_bench(latbench_size, latbench_count, 1))
     {
         latency_bench(latbench_size, latbench_count, 0);
     }
